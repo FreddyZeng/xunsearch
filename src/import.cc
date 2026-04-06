@@ -426,6 +426,12 @@ static int doc_fetch()
 			log_info("~skip to add/del synonyms (TERM:%.*s, SKIP_LEFT:%d)",
 					cmd.blen, term + 1, num_skip - total - 1);
 		} else {
+			if (size < (cmd.blen + cmd.blen1)) {
+				log_error("invalid synonyms command size (SIZE:%d, BLEN:%d, BLEN1:%d)",
+						size, cmd.blen, cmd.blen1);
+				rc = FETCH_ABORT;
+				goto doc_end;
+			}
 			string org_term = Xapian::Unicode::tolower(string(term + 1, cmd.blen));
 			string syn_term = Xapian::Unicode::tolower(string(term + cmd.blen + 1, cmd.blen1));
 #ifdef HAVE_SYNONYMS_STEM
@@ -581,7 +587,16 @@ static int doc_fetch()
 				}
 				// save first value as ID term for logging
 				if (term == NULL) {
-					term = strdup(buf);
+					if (size > 0 && buf != NULL) {
+						term = strdup(buf);
+						if (term == NULL) {
+							rc = FETCH_ABORT;
+							log_error("failed to duplicate doc value for term (SIZE:%d)", size);
+							goto doc_end;
+						}
+					} else {
+						log_notice("skip empty first doc value for term");
+					}
 				}
 				break;
 			case CMD_DOC_INDEX:
@@ -909,6 +924,7 @@ int main(int argc, char *argv[])
 	// check to archive
 	if ((flag & FLAG_DEFAULT_DB) && (database.get_doccount() >= DEFAULT_ARCHIVE_THRESHOLD)) {
 		char *ptr = strrchr(db_path, '/');
+		int arc_ok = 0;
 
 		log_alert("compact the database into archive (DB:%s, TOTAL:%d)", db_path, database.get_doccount());
 		if (ptr != NULL) {
@@ -917,34 +933,118 @@ int main(int argc, char *argv[])
 		}
 
 		database.close();
+
+		// if db_a is missing but db_o exists (previous failed archive), restore it
+		// NOTE: this check must happen BEFORE FLAG_ARCHIVE test, because FLAG_ARCHIVE
+		// is only set when db_a was successfully opened at startup. In the exact
+		// failure scenario we're recovering from (db_a lost, only db_o remains),
+		// FLAG_ARCHIVE would be false.
+		if (!(flag & FLAG_ARCHIVE)
+				&& access(DEFAULT_DB_NAME "_a", R_OK) != 0
+				&& access(DEFAULT_DB_NAME "_o", R_OK) == 0) {
+			log_notice("db_a missing but db_o found, restoring from previous backup");
+			if (system("/bin/mv -f " DEFAULT_DB_NAME "_o " DEFAULT_DB_NAME "_a") != 0) {
+				log_error("failed to restore db_o -> db_a, abort archive");
+				goto arc_end;
+			}
+			// re-open restored archive and set flag so compact path is taken
+			try {
+				archive = Xapian::WritableDatabase(DEFAULT_DB_NAME "_a", Xapian::DB_OPEN);
+				flag |= FLAG_ARCHIVE;
+				log_notice("restored archive database opened successfully");
+			} catch (const Xapian::Error &e) {
+				// db_a was just restored from db_o and is the last recoverable copy.
+				// Do NOT continue with archive flow — leave db_a for manual recovery.
+				log_error("failed to open restored archive (ERROR:%s), abort to preserve db_a",
+						e.get_msg().data());
+				goto arc_end;
+			}
+		}
+
 		if (flag & FLAG_ARCHIVE) {
 			archive.close();
 
-			// 1. merge: db_a + db -> db_c
+			// 1. clean stale intermediate db_c from previous failed attempts
+			// NOTE: keep db_o as recovery fallback until compact succeeds
 			log_info("rm -rf db_c");
 			system("/bin/rm -rf " DEFAULT_DB_NAME "_c");
-			log_info("xapian-compact db + db_a = db_c");
-			system(XAPIAN_DIR "/bin/xapian-compact -n " DEFAULT_DB_NAME "_a " DEFAULT_DB_NAME " " DEFAULT_DB_NAME "_c");
-			// 2. remove: db_o db
-			log_info("rm -rf db_o db");
-			system("/bin/rm -rf " DEFAULT_DB_NAME "_o " DEFAULT_DB_NAME);
-			// 3. rename: db_a -> db_o, db_c -> db_a
+
+			// 2. merge: db_a + db -> db_c
+			log_info("xapian-compact db_a + db = db_c");
+			if (system(XAPIAN_DIR "/bin/xapian-compact -n " DEFAULT_DB_NAME "_a " DEFAULT_DB_NAME " " DEFAULT_DB_NAME "_c") != 0) {
+				log_error("xapian-compact failed, abort archive");
+				goto arc_end;
+			}
+
+			// 4. rotate: compact succeeded (db_c is safe), now clear old db_o and rotate
+			log_info("rm -rf db_o");
+			system("/bin/rm -rf " DEFAULT_DB_NAME "_o");
 			log_info("mv -f db_a db_o");
-			system("/bin/mv -f " DEFAULT_DB_NAME "_a " DEFAULT_DB_NAME "_o");
+			if (system("/bin/mv -f " DEFAULT_DB_NAME "_a " DEFAULT_DB_NAME "_o") != 0) {
+				log_error("failed to move db_a to db_o, abort archive");
+				goto arc_end;
+			}
+
+			// 5. promote: db_c -> db_a (new archive in place)
 			log_info("mv -f db_c db_a");
-			system("/bin/mv -f " DEFAULT_DB_NAME "_c " DEFAULT_DB_NAME "_a");
+			if (system("/bin/mv -f " DEFAULT_DB_NAME "_c " DEFAULT_DB_NAME "_a") != 0) {
+				log_error("failed to move db_c to db_a, attempt rollback db_o -> db_a");
+				if (system("/bin/mv -f " DEFAULT_DB_NAME "_o " DEFAULT_DB_NAME "_a") != 0) {
+					log_error("rollback also failed, db_a missing! manual recovery needed from db_o");
+				}
+				goto arc_end;
+			}
+
+			// 6. remove old db (its data is now merged into db_a)
+			log_info("rm -rf db");
+			if (system("/bin/rm -rf " DEFAULT_DB_NAME) != 0) {
+				log_error("failed to remove old db after archive, search may return duplicates");
+			}
+			arc_ok = 1;
 		} else {
-			// 1. remove: db_a (clean)
-			log_info("rm -rf db_a");
-			system("/bin/rm -rf " DEFAULT_DB_NAME "_a");
-			// 2. rename: db -> db_a
+			// no existing archive: just rename db -> db_a
 			log_info("mv -f db db_a");
-			system("/bin/mv -f " DEFAULT_DB_NAME " " DEFAULT_DB_NAME "_a");
+			if (system("/bin/mv -f " DEFAULT_DB_NAME " " DEFAULT_DB_NAME "_a") != 0) {
+				log_error("failed to move db to db_a, abort archive");
+				goto arc_end;
+			}
+			arc_ok = 1;
 		}
 
-		// re-create empty db
-		log_info("re-create the empty default db");
-		database = Xapian::WritableDatabase(DEFAULT_DB_NAME, Xapian::DB_CREATE_OR_OPEN);
+arc_end:
+		if (arc_ok) {
+			// re-create empty db with retry for transient lock conflicts
+			// (searchd workers may briefly hold read locks on the db path during reopen)
+			int retry;
+			for (retry = 0; retry < 3; retry++) {
+				try {
+					log_info("re-create the empty default db (ATTEMPT:%d/3)", retry + 1);
+					if (retry > 0) {
+						sleep(1);
+					}
+					database = Xapian::WritableDatabase(DEFAULT_DB_NAME, Xapian::DB_CREATE_OR_OPEN);
+					break;
+				} catch (const Xapian::DatabaseLockError &e) {
+					log_error("lock conflict creating empty db (ATTEMPT:%d/3, ERROR:%s)",
+							retry + 1, e.get_msg().data());
+				} catch (const Xapian::Error &e) {
+					log_error("failed to re-create empty db (ATTEMPT:%d/3, ERROR:%s)",
+							retry + 1, e.get_msg().data());
+					break; // non-lock errors: no point retrying
+				}
+			}
+			if (retry >= 3) {
+				log_error("CRITICAL: empty db creation failed after 3 attempts, "
+						"archive data is safe in db_a, db will be re-created on next import");
+				// NOTE: do NOT set FLAG_TERMINATED here. Archive already succeeded and
+				// data is safe in db_a. A non-zero exit would cause indexd to keep the
+				// .snd file for retry, leading to duplicate data import.
+			}
+		} else {
+			// archive is an optimization, does not affect imported data (already in db)
+			// do not set FLAG_TERMINATED: import itself succeeded, only archive failed
+			log_error("archive aborted, database left as-is to avoid data loss");
+		}
 	}
 	database.close();
 

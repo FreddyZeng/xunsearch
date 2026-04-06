@@ -63,6 +63,10 @@ static int queue_size;
 static char xs_import[128], xs_logging[128], *prog_name;
 static volatile int main_flag, import_num;
 
+static int safe_write(int fd, void *buf, int size);
+static inline void update_eff_size(int fd);
+static inline void check_eff_size(int fd);
+
 /**
  * Show version information
  */
@@ -153,13 +157,70 @@ static void db_import_call(XS_DB *db, XS_USER *user)
 	// check old send file first
 	if (access(sndfile, R_OK) == 0) {
 		log_notice("priority use unfinished sndfile (FILE:%s)", sndfile);
+		if (db->count > 0 && db->fd >= 0) {
+			char rcvfile[128];
+			char buf[8192];
+			int rfd, sfd, n;
+			off_t hdr_size = sizeof(XS_CMD) + sizeof(struct xs_import_hdr);
+
+			sprintf(rcvfile, DEFAULT_TEMP_DIR "%s_%s.rcv", user->name, db->name);
+			close(db->fd);
+			db->fd = -1;
+
+			if ((rfd = open(rcvfile, O_RDONLY)) >= 0) {
+				if ((sfd = open(sndfile, O_RDWR)) >= 0) {
+					off_t snd_orig_size;
+					check_eff_size(rfd);
+					check_eff_size(sfd);
+					lseek(rfd, hdr_size, SEEK_SET);
+					snd_orig_size = lseek(sfd, 0, SEEK_END);
+
+					while ((n = read(rfd, buf, sizeof(buf))) > 0) {
+						if (safe_write(sfd, buf, n) != 0) {
+							log_error("failed to append rcvfile into sndfile (SRC:%s, DST:%s, ERROR:%s)",
+									rcvfile, sndfile, strerror(errno));
+							break;
+						}
+					}
+					if (n < 0) {
+						log_error("failed to read rcvfile for append (FILE:%s, ERROR:%s)",
+								rcvfile, strerror(errno));
+					}
+					if (n != 0) {
+						// read or write failed: rollback sndfile to original size
+						// to prevent duplicate data on next retry
+						log_notice("rollback sndfile to original size (FILE:%s, SIZE:%ld)",
+								sndfile, (long) snd_orig_size);
+						ftruncate(sfd, snd_orig_size);
+					} else {
+						update_eff_size(sfd);
+						if (unlink(rcvfile) == 0 || errno == ENOENT) {
+							log_notice("merged pending rcvfile into sndfile (SRC:%s, DST:%s, COUNT:%d)",
+									rcvfile, sndfile, db->count);
+							db->count = db->lcount = 0;
+							db->flag &= ~XS_DBF_FORCE_COMMIT;
+						} else {
+							log_error("failed to remove merged rcvfile (FILE:%s, ERROR:%s)",
+									rcvfile, strerror(errno));
+						}
+					}
+					close(sfd);
+				} else {
+					log_error("failed to open sndfile for append (FILE:%s, ERROR:%s)",
+							sndfile, strerror(errno));
+				}
+				close(rfd);
+			} else {
+				log_error("failed to open rcvfile for append (FILE:%s, ERROR:%s)",
+						rcvfile, strerror(errno));
+			}
+		}
 	} else {
 		char rcvfile[128], *suffix;
 		int i = 0;
 
 		// check to commit older file first
 		suffix = rcvfile + sprintf(rcvfile, DEFAULT_TEMP_DIR "%s_%s.rcv", user->name, db->name);
-#if SIZEOF_OFF_T < 8
 		for (i = MAX_SPLIT_FILES; i > 0; i--) {
 			sprintf(suffix, ".%d", i);
 			if (!access(rcvfile, R_OK)) {
@@ -173,7 +234,6 @@ static void db_import_call(XS_DB *db, XS_USER *user)
 				break;
 			}
 		}
-#endif	/* LARGEFILE */
 
 		// use new rcvfile
 		if (i == 0) {
@@ -435,8 +495,20 @@ static void rebuild_wdb_end(XS_DB *db, XS_USER *user)
 	sprintf(dbpath, "%s/%s", user->home, db->name);
 	log_info("rebuild finished, rename db (PATH:%s -> %s)", dbre, dbpath);
 	if (rmdir_r(dbpath) != 0 || rename(dbre, dbpath) != 0) {
+		char badpath[280];
 		log_error("failed to rename rebuilt database (DB:%s.%s, ERROR:%s)",
 				user->name, db->name, strerror(errno));
+		// preserve db.re for manual recovery, rename to .bad.<timestamp>
+		snprintf(badpath, sizeof(badpath), "%s.bad.%ld", dbre, (long) time(NULL));
+		if (rename(dbre, badpath) == 0) {
+			log_error("rebuilt database preserved for recovery (PATH:%s)", badpath);
+		} else {
+			log_error("failed to preserve rebuilt database (SRC:%s, DST:%s, ERROR:%s)",
+					dbre, badpath, strerror(errno));
+		}
+		db->flag &= ~XS_DBF_REBUILD_MASK;
+		db->flag |= XS_DBF_FORCE_COMMIT;
+		return;
 	}
 
 	// clean db_a
@@ -477,9 +549,9 @@ void signal_child(pid_t pid, int status)
 	time(&db->ltime);
 
 	// logging
-	log_notice("import exit (DB:%s.%s%s, FLAG:0x%04x, PID:%d, EXIT:%d)",
-			user->name, db->name, (db->flag & XS_DBF_REBUILD_BEGIN ? ".re" : ""), db->flag, pid, status);
 	sprintf(sndfile, DEFAULT_TEMP_DIR "%s_%s.snd", user->name, db->name);
+	log_notice("import exit (DB:%s.%s%s, FLAG:0x%04x, PID:%d, EXIT:%d, SND:%s)",
+			user->name, db->name, (db->flag & XS_DBF_REBUILD_BEGIN ? ".re" : ""), db->flag, pid, status, sndfile);
 
 	// check result
 	if (db->flag & XS_DBF_TOCLEAN) {
@@ -522,6 +594,7 @@ void signal_child(pid_t pid, int status)
 		log_notice("rebuild marked database (DB:%s.%s)", user->name, db->name);
 	} else if (status == 0) {
 		// quit normal, remove sndfile
+		db->import_fail = 0;
 		if (unlink(sndfile) != 0) {
 			log_error("failed to remove sndfile (PATH:%s, ERROR:%s)", sndfile, strerror(errno));
 		}
@@ -531,7 +604,35 @@ void signal_child(pid_t pid, int status)
 			rebuild_wdb_end(db, user);
 		}
 	} else {
-		// quit excepional, keep sndfile for next trying
+		// quit exceptional, keep sndfile for next trying
+		db->import_fail++;
+		log_error("import exited abnormally (DB:%s.%s, STATUS:%d, FILE:%s, FAIL_COUNT:%d/%d)",
+				user->name, db->name, status, sndfile, db->import_fail, MAX_IMPORT_FAIL);
+		if (db->import_fail >= MAX_IMPORT_FAIL) {
+			char badfile[280];
+			snprintf(badfile, sizeof(badfile), "%s.bad.%ld", sndfile, (long) time(NULL));
+			log_error("too many consecutive import failures, preserve sndfile (DB:%s.%s, FILE:%s -> %s)",
+					user->name, db->name, sndfile, badfile);
+			if (rename(sndfile, badfile) != 0) {
+				log_error("failed to rename sndfile (SRC:%s, DST:%s, ERROR:%s)",
+						sndfile, badfile, strerror(errno));
+			}
+			db->import_fail = 0;
+			// if rebuilding, abort the rebuild to avoid stuck state
+			if (db->flag & XS_DBF_REBUILD_BEGIN) {
+				char repath[256], badrepath[280];
+				sprintf(repath, "%s/%s.re", user->home, db->name);
+				snprintf(badrepath, sizeof(badrepath), "%s.bad.%ld", repath, (long) time(NULL));
+				log_error("abort stuck rebuild due to repeated failures (DB:%s.%s, PATH:%s -> %s)",
+						user->name, db->name, repath, badrepath);
+				if (rename(repath, badrepath) != 0) {
+					log_error("failed to rename rebuilt database (SRC:%s, DST:%s, ERROR:%s)",
+							repath, badrepath, strerror(errno));
+				}
+				db->flag &= ~XS_DBF_REBUILD_MASK;
+				db->flag |= XS_DBF_FORCE_COMMIT;
+			}
+		}
 	}
 }
 
@@ -625,7 +726,6 @@ static inline void check_eff_size(int fd)
 static inline void clean_uncommitted_data(XS_DB *db, XS_USER *user)
 {
 	// clean splitted file
-#if SIZEOF_OFF_T < 8
 	int i = 0;
 	char fpath[256], *suffix;
 
@@ -637,7 +737,6 @@ static inline void clean_uncommitted_data(XS_DB *db, XS_USER *user)
 			unlink(fpath);
 		}
 	}
-#endif	/* LARGEFILE */
 
 	// clean current file
 	lseek(db->fd, 0, SEEK_SET);
@@ -668,10 +767,21 @@ static int rebuild_conn_wdb(XS_CONN *conn)
 			log_debug_conn("clean uncommitted data for rebuilding");
 			clean_uncommitted_data(db, conn->user);
 		}
-		if (db->pid > 0 && !(db->flag & XS_DBF_TOCLEAN) && !kill(db->pid, SIGTERM)) {
-			// BUG: if import exit normal HERE may cause some problem
+		if (db->pid > 0 && !(db->flag & XS_DBF_TOCLEAN)) {
+			// set flag BEFORE kill to avoid race with signal_child
 			db->flag |= XS_DBF_REBUILD_WAIT;
-			log_notice_conn("notify running import to quit & set rebuild_wait flag");
+			if (kill(db->pid, SIGTERM) != 0) {
+				// process already gone, clear flag and clean manually
+				db->flag &= ~XS_DBF_REBUILD_WAIT;
+				char repath[256];
+				sprintf(repath, "%s/%s.re", conn->user->home, db->name);
+				if (!access(repath, R_OK)) {
+					log_notice("clean exists rebuilt database (PATH:%s)", repath);
+					rmdir_r(repath);
+				}
+			} else {
+				log_notice_conn("notify running import to quit & set rebuild_wait flag");
+			}
 		} else {
 			// clean exists rebuild db
 			char repath[256];
@@ -862,7 +972,6 @@ static int save_conn_request(XS_CONN *conn)
 		log_notice_conn("auto commit (DB:%s.%s, COUNT:%d)", conn->user->name, db->name, db->count);
 		db_import_call(db, conn->user);
 	}
-#if SIZEOF_OFF_T < 8
 	else if ((db->count - db->lcount) > queue_size) // check to split
 	{
 		struct stat st;
@@ -878,22 +987,27 @@ static int save_conn_request(XS_CONN *conn)
 			suffix = rcvfile2 + strlen(rcvfile2);
 
 			do {
-				sprintf(suffix, ".%d", i++);
-			} while (access(rcvfile2, R_OK) == 0);
+				sprintf(suffix, ".%d", i);
+			} while (access(rcvfile2, R_OK) == 0 && ++i <= MAX_SPLIT_FILES);
 
-			log_notice_conn("auto split data (FILE:%s, COUNT:%d)", rcvfile2, db->count);
-			close(db->fd);
-			db->fd = -1;
-			db->count = db->lcount = 0;
+			if (access(rcvfile2, R_OK) == 0) {
+				// all slots 1..MAX_SPLIT_FILES occupied
+				log_error_conn("too many split files, stop splitting (DB:%s.%s, MAX:%d)",
+						conn->user->name, db->name, MAX_SPLIT_FILES);
+			} else {
+				log_notice_conn("auto split data (FILE:%s, COUNT:%d)", rcvfile2, db->count);
+				close(db->fd);
+				db->fd = -1;
+				db->count = db->lcount = 0;
 
-			// rename the file
-			if (rename(rcvfile, rcvfile2) != 0) {
-				log_error_conn("failed to rename splitted file (FILE:%s, ERROR:%s)",
-						rcvfile2, strerror(errno));
+				// rename the file
+				if (rename(rcvfile, rcvfile2) != 0) {
+					log_error_conn("failed to rename splitted file (FILE:%s, ERROR:%s)",
+							rcvfile2, strerror(errno));
+				}
 			}
 		}
 	}
-#endif	/* LAREFILE */
 
 	// finished
 	rc = CONN_RES_OK(RQST_FINISHED);
